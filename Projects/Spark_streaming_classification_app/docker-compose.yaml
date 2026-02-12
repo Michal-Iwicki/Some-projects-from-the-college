@@ -1,0 +1,418 @@
+services:
+  # ---------------------------------------------------
+  # ZOOKEEPER
+  # ---------------------------------------------------
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.4.0
+    container_name: zookeeper
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+    ports:
+      - "2181:2181"
+    networks:
+      - bigdata
+
+  # ---------------------------------------------------
+  # KAFKA
+  # ---------------------------------------------------
+  kafka:
+    image: confluentinc/cp-kafka:7.4.0
+    container_name: kafka
+    depends_on:
+      - zookeeper
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:9092
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+    healthcheck:
+      test: ["CMD", "kafka-topics", "--bootstrap-server", "kafka:9092", "--list"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks: 
+      - bigdata
+
+  kafka-init:
+    image: confluentinc/cp-kafka:7.4.0
+    container_name: kafka-init
+    depends_on:
+      kafka:
+        condition: service_healthy
+    volumes:
+      - ./kafka/create-topics.sh:/create-topics.sh
+    entrypoint: ["bash", "/create-topics.sh"]
+    networks: 
+      - bigdata
+
+  kafka-ui:
+    image: provectuslabs/kafka-ui:latest
+    container_name: kafka_ui
+    depends_on:
+      - kafka
+    ports:
+      - "9000:8080"
+    environment:
+      KAFKA_CLUSTERS_0_NAME: local
+      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: "kafka:9092"
+      KAFKA_CLUSTERS_0_ZOOKEEPER: "zookeeper:2181"
+    networks:
+      - bigdata
+
+  # ---------------------------------------------------
+  # NIFI (persistent)
+  # ---------------------------------------------------
+  nifi:
+    image: apache/nifi:1.25.0
+    container_name: nifi
+    environment:
+      NIFI_WEB_HTTP_PORT: 8080
+    ports:
+      - "8080:8080"
+    volumes:
+      - nifi_conf:/opt/nifi/nifi-current/conf
+      - nifi_state:/opt/nifi/nifi-current/state
+      - nifi_db:/opt/nifi/nifi-current/database_repository
+      - nifi_flowfile:/opt/nifi/nifi-current/flowfile_repository
+      - nifi_content:/opt/nifi/nifi-current/content_repository
+      - nifi_logs:/opt/nifi/nifi-current/logs
+      - ./hadoop_conf:/opt/nifi/nifi-current/hadoop_conf
+      - ./data:/data/in
+      - ./data_historic:/data_historic
+      - ./nifi_templates:/opt/nifi/nifi-current/conf/templates
+    networks:
+      - bigdata
+
+  # ---------------------------------------------------
+  # HDFS (NameNode)
+  # ---------------------------------------------------
+  hdfs-namenode:
+    image: bde2020/hadoop-namenode:2.0.0-hadoop3.2.1-java8
+    container_name: hdfs-namenode
+    environment:
+      CLUSTER_NAME: bigdata
+      CORE_CONF_fs_defaultFS: "hdfs://hdfs-namenode:8020"
+    ports:
+      - "9870:9870"
+    volumes:
+      - ./hdfs_metadata:/hadoop/dfs/name
+    networks:
+      - bigdata
+
+  # ---------------------------------------------------
+  # HDFS (DataNode)
+  # ---------------------------------------------------
+  hdfs-datanode:
+    image: bde2020/hadoop-datanode:2.0.0-hadoop3.2.1-java8
+    container_name: hdfs-datanode
+    depends_on:
+      - hdfs-namenode
+    environment:
+      CLUSTER_NAME: bigdata
+      CORE_CONF_fs_defaultFS: "hdfs://hdfs-namenode:8020"
+    volumes:
+      - ./hdfs_blocks:/hadoop/dfs/data
+    networks:
+      - bigdata
+
+  # ---------------------------------------------------
+  # SPARK
+  # ---------------------------------------------------
+  spark-master:
+    image: apache/spark:3.5.1
+    container_name: spark-master
+    hostname: spark-master
+    command: >
+      /opt/spark/bin/spark-class
+      org.apache.spark.deploy.master.Master
+    ports:
+      - "7077:7077"
+      - "8082:8080"
+    networks:
+      - bigdata 
+    
+
+  spark-worker:
+    image: apache/spark:3.5.1
+    container_name: spark-worker
+    depends_on:
+      - spark-master
+    command: >
+      /opt/spark/bin/spark-class
+      org.apache.spark.deploy.worker.Worker
+      spark://spark-master:7077
+      --cores 2
+      --memory 2g
+    ports:
+      - "8081:8081"   # Worker UI
+    volumes:
+      - ./model_store:/models  
+      - ./reports:/reports 
+    networks:
+      - bigdata
+
+
+  spark-streaming:
+    build:
+      context: ./spark
+      dockerfile: Dockerfile
+    container_name:  spark-kafka-streaming
+    depends_on:
+      spark-master:
+        condition: service_started
+      kafka:
+        condition: service_healthy
+      kafka-init:
+        condition: service_completed_successfully
+      cassandra:
+        condition: service_healthy
+    entrypoint: ["/opt/spark/bin/spark-submit"]
+    command:
+      - --master
+      - spark://spark-master:7077
+      - --deploy-mode
+      - client
+      - --conf
+      - spark.driver.extraJavaOptions=-Divy.cache.dir=/tmp -Divy.home=/tmp
+      - --packages
+      - org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.1,com.datastax.spark:spark-cassandra-connector_2.12:3.5.1
+      - /opt/apps/streaming_job.py
+    volumes:
+      - ./spark:/opt/apps
+      - ./model_store:/models  
+    networks:
+      - bigdata
+
+  spark-training:
+    build:
+      context: ./spark
+      dockerfile: Dockerfile
+    container_name: spark-training
+    profiles: ["training"]
+    depends_on:
+      - spark-master
+      - spark-worker
+      - hdfs-namenode
+      - hdfs-datanode
+    entrypoint:
+      - /bin/bash
+      - -c
+      - |
+        echo "[spark-training] Preparing Ivy cache..."
+        mkdir -p /tmp/ivy
+
+        mkdir -p /models /reports
+        chown -R spark:spark /models /reports
+        
+        echo "[spark-training] Submitting Spark job..."
+
+        /opt/spark/bin/spark-submit \
+          --master spark://spark-master:7077 \
+          --deploy-mode client \
+          --name FlightDelayTraining \
+          --conf spark.executor.instances=1 \
+          --conf spark.executor.cores=2 \
+          --conf spark.executor.memory=2g \
+          --conf spark.driver.memory=2g \
+          --conf spark.sql.shuffle.partitions=4 \
+          --conf spark.hadoop.fs.defaultFS=hdfs://hdfs-namenode:8020 \
+          --conf spark.jars.ivy=/tmp/ivy \
+          --conf spark.driver.extraJavaOptions="-Divy.cache.dir=/tmp/ivy -Divy.home=/tmp/ivy" \
+          --packages org.apache.spark:spark-avro_2.12:3.5.1 \
+          /opt/apps/training_job.py
+
+        echo "[spark-training] Job finished."
+    volumes:
+      - ./spark:/opt/apps
+      - ./hadoop_conf:/opt/hadoop/conf
+      - ./model_store:/models
+      - ./reports:/reports
+    environment:
+      HADOOP_CONF_DIR: /opt/hadoop/conf
+    networks:
+      - bigdata
+
+
+  spark-training-gbt:
+    build:
+      context: ./spark
+      dockerfile: Dockerfile
+    container_name: spark-training-gbt
+    profiles: ["training-gbt"]
+    depends_on:
+      - spark-master
+      - spark-worker
+      - hdfs-namenode
+      - hdfs-datanode
+
+    entrypoint:
+      - /bin/bash
+      - -c
+      - |
+        echo "[spark-training-gbt] Preparing Ivy cache..."
+        mkdir -p /tmp/ivy /models /reports
+        chown -R spark:spark /models /reports
+
+        echo "[spark-training-gbt] Submitting GBT training job..."
+
+        /opt/spark/bin/spark-submit \
+          --master spark://spark-master:7077 \
+          --deploy-mode client \
+          --name FlightDelayTrainingGBT \
+          --conf spark.executor.instances=1 \
+          --conf spark.executor.cores=2 \
+          --conf spark.executor.memory=2g \
+          --conf spark.driver.memory=2g \
+          --conf spark.sql.shuffle.partitions=4 \
+          --conf spark.hadoop.fs.defaultFS=hdfs://hdfs-namenode:8020 \
+          --conf spark.jars.ivy=/tmp/ivy \
+          --conf spark.driver.extraJavaOptions="-Divy.cache.dir=/tmp/ivy -Divy.home=/tmp/ivy" \
+          --packages org.apache.spark:spark-avro_2.12:3.5.1 \
+          /opt/apps/training_gbt.py
+
+        echo "[spark-training-gbt] Job finished."
+
+    volumes:
+      - ./spark:/opt/apps
+      - ./hadoop_conf:/opt/hadoop/conf
+      - ./model_store:/models
+      - ./reports:/reports
+
+    environment:
+      HADOOP_CONF_DIR: /opt/hadoop/conf
+
+    networks:
+      - bigdata
+
+  # ---------------------------------------------------
+  # SPARK BATCH: HISTORICAL ANALYSIS (HDFS -> CASSANDRA)
+  # ---------------------------------------------------
+  spark-historical-analysis:
+    build:
+      context: ./spark
+      dockerfile: Dockerfile
+    container_name: spark-historical-analysis
+    profiles: ["historical-analysis"]
+    depends_on:
+      spark-master:
+        condition: service_started
+      hdfs-namenode:
+        condition: service_started
+      hdfs-datanode:
+        condition: service_started
+      cassandra-init:
+        condition: service_started
+      spark-worker:
+        condition: service_started
+    entrypoint:
+      - /bin/bash
+      - -c
+      - |
+        echo "[historical-analysis] Preparing Ivy cache..."
+        mkdir -p /tmp/ivy
+        chown -R spark:spark /tmp/ivy
+
+        echo "[historical-analysis] Submitting Spark batch job..."
+
+        /opt/spark/bin/spark-submit \
+          --master spark://spark-master:7077 \
+          --deploy-mode client \
+          --name "Historical Analysis" \
+          --conf spark.executor.instances=1 \
+          --conf spark.executor.cores=2 \
+          --conf spark.executor.memory=2g \
+          --conf spark.driver.memory=2g \
+          --conf spark.sql.shuffle.partitions=4 \
+          --conf spark.hadoop.fs.defaultFS=hdfs://hdfs-namenode:8020 \
+          --conf spark.cassandra.connection.host=cassandra \
+          --conf spark.jars.ivy=/tmp/ivy \
+          --conf spark.driver.extraJavaOptions="-Divy.cache.dir=/tmp/ivy -Divy.home=/tmp/ivy" \
+          --packages \
+          org.apache.spark:spark-avro_2.12:3.5.1,com.datastax.spark:spark-cassandra-connector_2.12:3.5.1 \
+          /opt/apps/historical_analysis_job.py
+
+        echo "[historical-analysis] Job finished."
+    volumes:
+      - ./spark:/opt/apps
+      - ./hadoop_conf:/opt/hadoop/conf
+    environment:
+      HADOOP_CONF_DIR: /opt/hadoop/conf
+    networks:
+      - bigdata
+
+
+  # ---------------------------------------------------
+  # CASSANDRA
+  # ---------------------------------------------------
+  cassandra:
+    image: cassandra:4.1
+    container_name: cassandra
+    ports:
+      - "9042:9042"
+    environment:
+      CASSANDRA_CLUSTER_NAME: BigDataCluster
+      CASSANDRA_DC: datacenter1
+    volumes:
+      - cassandra_data:/var/lib/cassandra
+    healthcheck:
+      test: ["CMD-SHELL", "cqlsh cassandra 9042 -e 'SELECT now() FROM system.local;' || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 20s
+    networks:
+      - bigdata
+
+
+  cassandra-init:
+    image: cassandra:4.1
+    container_name: cassandra-init
+    depends_on:
+      cassandra:
+        condition: service_healthy
+    volumes:
+      - ./cassandra/init.cql:/init.cql
+    entrypoint: ["cqlsh", "cassandra", "-f", "/init.cql"]
+    networks:
+      - bigdata
+
+
+  # ---------------------------------------------------
+  # STREAMLIT
+  # ---------------------------------------------------
+  streamlit:
+    build:
+      context: ./streamlit_app
+      dockerfile: Dockerfile
+    container_name: streamlit
+    depends_on:
+      - cassandra
+    ports:
+      - "8501:8501"
+    volumes:
+      - ./streamlit_app:/app
+    working_dir: /app
+    networks:
+      - bigdata
+
+
+# ---------------------------------------------------
+# VOLUMES
+# ---------------------------------------------------
+volumes:
+  cassandra_data:
+  nifi_conf:
+  nifi_state:
+  nifi_db:
+  nifi_flowfile:
+  nifi_content:
+  nifi_logs:
+  #model_store:
+# ---------------------------------------------------
+# NETWORK
+# ---------------------------------------------------
+networks:
+  bigdata:
+    driver: bridge

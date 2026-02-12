@@ -1,0 +1,7 @@
+streamlit
+streamlit-autorefresh
+cassandra-driver
+pandas
+pyspark
+plotly
+statsmodels

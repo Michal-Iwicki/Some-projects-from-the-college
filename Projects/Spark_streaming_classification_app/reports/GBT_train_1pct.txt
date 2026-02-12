@@ -1,0 +1,20 @@
+Model: GBT
+AUC: 0.6570
+
+=== DATASET SIZES ===
+Train size: 30158
+Test size: 58796
+
+=== LABEL DISTRIBUTION ===
+Train:
+  label=1: 15077 (0.500)
+  label=0: 15081 (0.500)
+Test:
+  label=1: 17211 (0.293)
+  label=0: 41585 (0.707)
+
+=== CONFUSION MATRIX (label, prediction) ===
+label=0, pred=0 → 33583
+label=0, pred=1 → 8002
+label=1, pred=0 → 9990
+label=1, pred=1 → 7221

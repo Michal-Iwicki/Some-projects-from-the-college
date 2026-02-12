@@ -1,0 +1,30 @@
+# System
+.DS_Store
+Thumbs.db
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.env
+.venv
+venv/
+
+# Docker
+*.log
+*.pid
+*.tar
+*.gz
+
+# VSCode / IDE
+.vscode/
+.idea/
+
+# NiFi / Cassandra data
+hdfs_blocks
+hdfs_metadata
+cassandra_data
+#model_store
+data_historic/merged
+model_store
